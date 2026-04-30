@@ -10,8 +10,8 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import CNNTradFpool3
-from pruning import prune_cnntrad, count_params, verify_output_shape
+from training_code.model import CNNTradFpool3
+from training_code.pruning import prune_cnntrad, count_params, verify_output_shape
 
 # ====================================================================================
 #                               Configuration

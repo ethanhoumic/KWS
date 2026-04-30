@@ -2,10 +2,10 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import CNNTradFpool3
-from pruning import prune_cnntrad
-from ptq import fake_quant_forward
-from train_pruned import (
+from training_code.model import CNNTradFpool3
+from training_code.pruning import prune_cnntrad
+from training_code.ptq import fake_quant_forward
+from training_code.train_pruned import (
     SpeechCommandDataset, SpeechDataset, MelSpectrogram, CFG
 )
 

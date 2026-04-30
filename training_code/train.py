@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from model import CNNTradFpool3
+from training_code.model import CNNTradFpool3
 
 # ====================================================================================
 #                                sample prepare

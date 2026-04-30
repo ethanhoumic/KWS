@@ -3,9 +3,9 @@ import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 
-from model import CNNTradFpool3
-from pruning import prune_cnntrad
-from train_pruned import SpeechCommandDataset, SpeechDataset, MelSpectrogram, CFG
+from training_code.model import CNNTradFpool3
+from training_code.pruning import prune_cnntrad
+from training_code.train_pruned import SpeechCommandDataset, SpeechDataset, MelSpectrogram, CFG
 from torch.utils.data import DataLoader
 import random
 

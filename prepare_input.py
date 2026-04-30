@@ -5,8 +5,8 @@ import torchaudio
 from pathlib import Path
 
 # 直接複製 dataset.py 的前處理邏輯
-from train import MelSpectrogram   # 或直接從 dataset.py import
-from train import SpeechCommandDataset, SpeechDataset
+from training_code.train import MelSpectrogram   # 或直接從 dataset.py import
+from training_code.train import SpeechCommandDataset, SpeechDataset
 
 mel_transform = MelSpectrogram(sample_rate=16000)
 dataset_manager = SpeechCommandDataset(data_dir='./archive')

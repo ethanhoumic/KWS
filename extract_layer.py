@@ -6,10 +6,20 @@ extract_layers.py
 把每層的量化整數輸出存成 .txt（一個數字一行），
 供 C model 比對用。
 
+同時提取每層的離線參數：
+  K^(k)  = Z3 + M * (q_bias^(k) - Z1 * sum_j(q2^(j,k)))   [per output channel, int64]
+  M0^(k) = round(M^(k) * 2^n)                               [per output channel, int64]
+  n      = shift amount                                      [scalar, int]
+
+儲存格式（每層）：
+  {layer}_M0.txt   : C_out 個 int64，順序 = output channel 0, 1, ..., C_out-1
+  {layer}_n.txt    : 1 個 int，scalar
+  {layer}_K.txt    : C_out 個 int64，順序 = output channel 0, 1, ..., C_out-1
+
 用法：
-    python extract_layers.py \
-        --pth  quantized_params.pth \
-        --input input_sample.npy   \   # shape: (1, C, H, W)，float32
+    python extract_layers.py
+        --pth  quantized_params.pth
+        --input input_sample.npy      # shape: (1, C, H, W), float32
         --outdir ./layer_outputs
 """
 
@@ -33,8 +43,84 @@ def to_uint8(x_fp: torch.Tensor, scale: float, zp: int, n_bits: int = 8):
 
 def save_txt(arr: np.ndarray, path: str):
     """flatten 後一行一個整數存檔"""
-    np.savetxt(path, arr.flatten().astype(np.int32), fmt='%d')
+    np.savetxt(path, arr.flatten().astype(np.int64), fmt='%d')
     print(f"  saved {path}  shape={arr.shape}  range=[{arr.min()}, {arr.max()}]")
+
+
+# ==============================================================================
+#  離線參數計算：M0, n, K
+# ==============================================================================
+
+def compute_offline_params(
+    s_in:     float,          # 輸入 activation scale (scalar)
+    scale_w:  np.ndarray,     # weight scale, shape (C_out,)，per-channel
+    s_out:    float,          # 輸出 activation scale (scalar)
+    zp_out:   int,            # 輸出 activation zero-point Z3 (scalar)
+    zp_in:    int,            # 輸入 activation zero-point Z1 (scalar)
+    w_int:    np.ndarray,     # 量化後的 weight，shape (C_out, ...)，int8
+    b_int:    np.ndarray,     # 量化後的 bias，shape (C_out,)，int32
+    total_bits: int = 31
+):
+    """
+    計算每層的離線參數 M0, n, K。
+
+    符號對應（依照推導）：
+        q1 = activation (input)，非對稱，zero-point = Z1 = zp_in
+        q2 = weight，對稱，Z2 = 0
+        q3 = output activation，非對稱，zero-point = Z3 = zp_out
+
+    公式：
+        M^(k)  = s_in * scale_w^(k) / s_out          per output channel
+        M0^(k) = round(M^(k) * 2^n)                  fixed-point repr of M
+        n      = 使所有 channel 的 M0 都 < 2^total_bits 的最大 shift
+
+        weight_col_sum^(k) = sum_j( q2^(j,k) )       對 weight 的所有 input dim 加總
+                                                       shape: (C_out,)
+        K^(k) = Z3 + M0^(k) * (q_bias^(k) - Z1 * weight_col_sum^(k)) / 2^n
+              ≈ Z3 + round( M^(k) * (q_bias^(k) - Z1 * weight_col_sum^(k)) )
+
+        K 直接用 FP 乘法計算（離線不需要省運算）：
+        K^(k) = Z3 + round( M^(k) * (q_bias^(k) - Z1 * weight_col_sum^(k)) )
+
+    回傳：
+        M0   : np.ndarray, shape (C_out,), dtype int64
+        n    : int, scalar
+        K    : np.ndarray, shape (C_out,), dtype int64
+    """
+
+    # ── M per output channel ──────────────────────────────────────────────────
+    # scale_w shape: (C_out,)
+    M = (s_in * scale_w) / s_out                          # (C_out,), float64
+
+    # ── 找 shift n：讓最大的 M 正規化後 M0 < 2^total_bits ──────────────────
+    # M0 = round(M * 2^n)，我們要 M0_max < 2^total_bits
+    # → n = total_bits - 1 - floor(log2(M_max))
+    n = int(total_bits - 1 - np.floor(np.log2(M.max())))
+    n = max(n, 0)
+
+    # ── M0 per output channel ─────────────────────────────────────────────────
+    M0 = np.round(M * (2 ** n)).astype(np.int64)          # (C_out,)
+
+    # ── weight column sum per output channel ─────────────────────────────────
+    # w_int shape: (C_out, C_in, kH, kW) for Conv2d
+    #              (C_out, C_in)          for Linear
+    # 把除了 C_out 以外的所有維度加總
+    w_flat = w_int.reshape(w_int.shape[0], -1)             # (C_out, N)
+    weight_col_sum = w_flat.sum(axis=1).astype(np.int64)   # (C_out,)
+
+    # ── bias ──────────────────────────────────────────────────────────────────
+    if b_int is None:
+        b_int_arr = np.zeros(w_int.shape[0], dtype=np.float64)
+    else:
+        b_int_arr = b_int.astype(np.float64)               # (C_out,)
+
+    # ── K per output channel（FP 乘法，精確計算）─────────────────────────────
+    # correction^(k) = q_bias^(k) - Z1 * weight_col_sum^(k)   (int 層面的修正)
+    # K^(k) = Z3 + round( M^(k) * correction^(k) )
+    correction = b_int_arr - float(zp_in) * weight_col_sum.astype(np.float64)
+    K = np.round(float(zp_out) + M * correction).astype(np.int64)   # (C_out,)
+
+    return M0, n, K
 
 
 # ==============================================================================
@@ -54,151 +140,198 @@ def integer_forward(pth_path: str, x_fp: torch.Tensor, outdir: str, n_bits: int 
     def aq(name):
         return act_quant[name]['scale'], act_quant[name]['zero_point']
 
+    def save_offline(layer_name, M0, n, K):
+        """統一儲存 M0, n, K，並印出順序說明"""
+        save_txt(M0, os.path.join(outdir, f'{layer_name}_M0.txt'))
+        np.savetxt(os.path.join(outdir, f'{layer_name}_n.txt'),
+                   np.array([n]), fmt='%d')
+        print(f"  saved {outdir}/{layer_name}_n.txt  n={n}")
+        save_txt(K,  os.path.join(outdir, f'{layer_name}_K.txt'))
+
     # ── 輸入量化 ──────────────────────────────────────────────────────────────
     s_in, zp_in = aq('input')
     x_q = to_uint8(x_fp.float(), s_in, zp_in, n_bits)   # uint8, shape (1,C,H,W)
     save_txt(x_q.numpy(), os.path.join(outdir, 'input_q.txt'))
 
-    # ── 計算每層 requantization multiplier M0, shift n, K ────────────────────
-    # M = S_in * S_w / S_out，拆成 M0 * 2^(-n)（定點數）
-    # K  = bias_int + ZP_out * (sum of correction terms)
-    # 這裡用 Python float 模擬，C side 要用對應的 int 版本
-
-    def requant_params(s_in_layer, scale_w, s_out, total_bits=32):
-        """
-        回傳 (M0_array, n) per output channel
-        M = s_in * s_w / s_out
-        M0 = round(M * 2^n)，n 使 M0 落在 [2^(total_bits-1), 2^total_bits)
-        """
-        M = (s_in_layer * scale_w.numpy()) / s_out   # (OC,)
-        # 找最大 n 使 M0 < 2^31
-        n = int(np.floor(-np.log2(M.max()))) + total_bits - 2
-        n = max(n, 0)
-        M0 = np.round(M * (2 ** n)).astype(np.int64)
-        return M0, n
-
     # ── conv1 ─────────────────────────────────────────────────────────────────
-    s_in_l, zp_in_l = aq('input')
+    s_in_l,  zp_in_l  = aq('input')
     s_out_l, zp_out_l = aq('relu1')
 
-    w1   = wq['conv1']['w_int'].float()          # (OC, IC, kH, kW) int8
-    b1   = wq['conv1']['b_int']                  # (OC,) int32
-    
+    w1  = wq['conv1']['w_int']                           # (OC, IC, kH, kW) int8
+    b1  = wq['conv1']['b_int']                           # (OC,) int32
+
     save_txt(w1.numpy().astype(np.int8), os.path.join(outdir, 'conv1_w.txt'))
 
-    # conv in integer domain: input - ZP_in, weight already zero-centered (symmetric)
-    # x_shifted = (x_q - zp_in_l).float()         # (1, IC, H, W)
-    x_shifted = x_q.float()
-    
-    # conv1: kernel=(67,8), stride=(1,1), padding=0 → output (1,64,35,33)
-    acc1 = F.conv2d(x_shifted, w1, None, stride=(1,1), padding=0)
-    # 加 bias（int32）
-    # if b1 is not None:
-    #     acc1 = acc1 + b1.float().view(1, -1, 1, 1)
+    # 計算並儲存離線參數
+    M0_1, n1, K1 = compute_offline_params(
+        s_in=s_in_l,
+        scale_w=wq['conv1']['scale_w'].numpy(),
+        s_out=s_out_l,
+        zp_out=zp_out_l,
+        zp_in=zp_in_l,
+        w_int=w1.numpy(),
+        b_int=b1.numpy() if b1 is not None else None,
+    )
+    save_offline('conv1', M0_1, n1, K1)
+
+    # integer forward
+    x_shifted = (x_q - zp_in_l).float()
+    acc1 = F.conv2d(x_shifted, w1.float(), None, stride=(1,1), padding=0)
+    if b1 is not None:
+        acc1 = acc1 + b1.float().view(1, -1, 1, 1)
 
     save_txt(acc1.numpy().astype(np.int32), os.path.join(outdir, 'conv1_acc.txt'))
 
-    # requantize → uint8
-    M0_1, n1 = requant_params(s_in_l, wq['conv1']['scale_w'], s_out_l)
     M0_1_t = torch.tensor(M0_1, dtype=torch.int64).view(1, -1, 1, 1)
     acc1_i  = acc1.to(torch.int64)
     req1    = ((acc1_i * M0_1_t) >> n1) + zp_out_l
     req1    = req1.clamp(0, 255).to(torch.int32)
 
-    # ReLU in integer domain = clamp below ZP
     relu1_q = req1.clamp(min=zp_out_l)
     save_txt(relu1_q.numpy(), os.path.join(outdir, 'relu1_q.txt'))
 
     # ── conv2 ─────────────────────────────────────────────────────────────────
-    s_in_l, zp_in_l = aq('relu1')
+    s_in_l,  zp_in_l  = aq('relu1')
     s_out_l, zp_out_l = aq('relu2')
 
-    w2  = wq['conv2']['w_int'].float()
+    w2  = wq['conv2']['w_int']
     b2  = wq['conv2']['b_int']
+    
+    save_txt(w2.numpy().astype(np.int8), os.path.join(outdir, 'conv2_w.txt'))
+    save_txt(b2.numpy().astype(np.int32), os.path.join(outdir, 'conv2_b.txt'))
+
+    M0_2, n2, K2 = compute_offline_params(
+        s_in=s_in_l,
+        scale_w=wq['conv2']['scale_w'].numpy(),
+        s_out=s_out_l,
+        zp_out=zp_out_l,
+        zp_in=zp_in_l,
+        w_int=w2.numpy(),
+        b_int=b2.numpy() if b2 is not None else None,
+    )
+    save_offline('conv2', M0_2, n2, K2)
 
     x_shifted = (relu1_q - zp_in_l).float()
-
-    # conv2: kernel=(10,4), stride=(1,1), padding=0 → output (1,64,26,30)
-    acc2 = F.conv2d(x_shifted, w2, None, stride=(1,1), padding=0)
+    acc2 = F.conv2d(x_shifted, w2.float(), None, stride=(1,1), padding=0)
     if b2 is not None:
         acc2 = acc2 + b2.float().view(1, -1, 1, 1)
 
     save_txt(acc2.numpy().astype(np.int32), os.path.join(outdir, 'conv2_acc.txt'))
 
-    M0_2, n2 = requant_params(s_in_l, wq['conv2']['scale_w'], s_out_l)
-    M0_2_t   = torch.tensor(M0_2, dtype=torch.int64).view(1, -1, 1, 1)
-    acc2_i   = acc2.to(torch.int64)
-    req2     = ((acc2_i * M0_2_t) >> n2) + zp_out_l
-    req2     = req2.clamp(0, 255).to(torch.int32)
+    M0_2_t = torch.tensor(M0_2, dtype=torch.int64).view(1, -1, 1, 1)
+    acc2_i  = acc2.to(torch.int64)
+    req2    = ((acc2_i * M0_2_t) >> n2) + zp_out_l
+    req2    = req2.clamp(0, 255).to(torch.int32)
 
-    relu2_q  = req2.clamp(min=zp_out_l)
+    relu2_q = req2.clamp(min=zp_out_l)
     save_txt(relu2_q.numpy(), os.path.join(outdir, 'relu2_q.txt'))
 
     # ── flatten ───────────────────────────────────────────────────────────────
     x_flat = relu2_q.view(1, -1)   # (1, N)
 
     # ── linear ────────────────────────────────────────────────────────────────
-    s_in_l, zp_in_l = aq('relu2')
+    s_in_l,  zp_in_l  = aq('relu2')
     s_out_l, zp_out_l = aq('linear')
 
-    wL  = wq['linear']['w_int'].float()   # (OC, IC)
+    wL  = wq['linear']['w_int']   # (OC, IC)
     bL  = wq['linear']['b_int']
+    
+    save_txt(wL.numpy().astype(np.int8), os.path.join(outdir, 'linear_w.txt'))
+    save_txt(bL.numpy().astype(np.int32), os.path.join(outdir, 'linear_b.txt'))
+
+    M0_L, nL, KL = compute_offline_params(
+        s_in=s_in_l,
+        scale_w=wq['linear']['scale_w'].numpy(),
+        s_out=s_out_l,
+        zp_out=zp_out_l,
+        zp_in=zp_in_l,
+        w_int=wL.numpy(),
+        b_int=bL.numpy() if bL is not None else None,
+    )
+    save_offline('linear', M0_L, nL, KL)
 
     x_shifted = (x_flat - zp_in_l).float()
-    accL = F.linear(x_shifted, wL, None)
+    accL = F.linear(x_shifted, wL.float(), None)
     if bL is not None:
         accL = accL + bL.float().view(1, -1)
 
     save_txt(accL.numpy().astype(np.int32), os.path.join(outdir, 'linear_acc.txt'))
 
-    M0_L, nL = requant_params(s_in_l, wq['linear']['scale_w'], s_out_l)
-    M0_L_t   = torch.tensor(M0_L, dtype=torch.int64).view(1, -1)
-    accL_i   = accL.to(torch.int64)
-    reqL     = ((accL_i * M0_L_t) >> nL) + zp_out_l
-    # linear 後無 ReLU，不做 clamp(min=zp)
+    M0_L_t = torch.tensor(M0_L, dtype=torch.int64).view(1, -1)
+    accL_i  = accL.to(torch.int64)
+    reqL    = ((accL_i * M0_L_t) >> nL) + zp_out_l
     linear_q = reqL.clamp(0, 255).to(torch.int32)
     save_txt(linear_q.numpy(), os.path.join(outdir, 'linear_q.txt'))
 
     # ── dnn ───────────────────────────────────────────────────────────────────
-    s_in_l, zp_in_l = aq('linear')
+    s_in_l,  zp_in_l  = aq('linear')
     s_out_l, zp_out_l = aq('relu3')
 
-    wD  = wq['dnn']['w_int'].float()
+    wD  = wq['dnn']['w_int']
     bD  = wq['dnn']['b_int']
 
+    save_txt(wD.numpy().astype(np.int8), os.path.join(outdir, 'dnn_w.txt'))
+    save_txt(bD.numpy().astype(np.int32), os.path.join(outdir, 'dnn_b.txt'))
+
+    M0_D, nD, KD = compute_offline_params(
+        s_in=s_in_l,
+        scale_w=wq['dnn']['scale_w'].numpy(),
+        s_out=s_out_l,
+        zp_out=zp_out_l,
+        zp_in=zp_in_l,
+        w_int=wD.numpy(),
+        b_int=bD.numpy() if bD is not None else None,
+    )
+    save_offline('dnn', M0_D, nD, KD)
+
     x_shifted = (linear_q - zp_in_l).float()
-    accD = F.linear(x_shifted, wD, None)
+    accD = F.linear(x_shifted, wD.float(), None)
     if bD is not None:
         accD = accD + bD.float().view(1, -1)
 
     save_txt(accD.numpy().astype(np.int32), os.path.join(outdir, 'dnn_acc.txt'))
 
-    M0_D, nD = requant_params(s_in_l, wq['dnn']['scale_w'], s_out_l)
-    M0_D_t   = torch.tensor(M0_D, dtype=torch.int64).view(1, -1)
-    accD_i   = accD.to(torch.int64)
-    reqD     = ((accD_i * M0_D_t) >> nD) + zp_out_l
-    reqD     = reqD.clamp(0, 255).to(torch.int32)
+    M0_D_t = torch.tensor(M0_D, dtype=torch.int64).view(1, -1)
+    accD_i  = accD.to(torch.int64)
+    reqD    = ((accD_i * M0_D_t) >> nD) + zp_out_l
+    reqD    = reqD.clamp(0, 255).to(torch.int32)
 
-    relu3_q  = reqD.clamp(min=zp_out_l)
+    relu3_q = reqD.clamp(min=zp_out_l)
     save_txt(relu3_q.numpy(), os.path.join(outdir, 'relu3_q.txt'))
 
     # ── classifier ────────────────────────────────────────────────────────────
-    # 最後一層不做 requant（logits 保持 int32 比較大小即可）
-    s_in_l, zp_in_l = aq('relu3')
+    # 最後一層不做 requant，logits 保持 int32
+    # 但仍計算 K, M0, n 供 C model 參考（若之後需要 requant 可直接使用）
+    s_in_l,  zp_in_l  = aq('relu3')
 
-    wC  = wq['classifier']['w_int'].float()
+    wC  = wq['classifier']['w_int']
     bC  = wq['classifier']['b_int']
 
     x_shifted = (relu3_q - zp_in_l).float()
-    accC = F.linear(x_shifted, wC, None)
+    accC = F.linear(x_shifted, wC.float(), None)
     if bC is not None:
         accC = accC + bC.float().view(1, -1)
 
     save_txt(accC.numpy().astype(np.int32), os.path.join(outdir, 'classifier_acc.txt'))
 
-    print("\n[Done] All layer outputs saved to:", outdir)
-    print("  Files: input_q, conv1_acc, relu1_q, conv2_acc, relu2_q,")
-    print("         linear_acc, linear_q, dnn_acc, relu3_q, classifier_acc")
+    # ===========================================================================
+    print("\n" + "="*60)
+    print("[Done] All layer outputs saved to:", outdir)
+    print("="*60)
+    print("\n[Activation outputs]")
+    print("  input_q, conv1_acc, relu1_q, conv2_acc, relu2_q,")
+    print("  linear_acc, linear_q, dnn_acc, relu3_q, classifier_acc")
+    print("\n[Offline params] 每層三個檔案，順序如下：")
+    print("  {layer}_M0.txt : C_out 個 int64，index 0 = output channel 0")
+    print("  {layer}_n.txt  : 1 個 int，scalar shift amount")
+    print("  {layer}_K.txt  : C_out 個 int64，index 0 = output channel 0")
+    print("\n  Layers: conv1, conv2, linear, dnn")
+    print("\n[K 的計算公式]")
+    print("  K[k] = Z3 + ((M0[k] * (q_bias[k] - Z1 * weight_col_sum[k])) >> n)")
+    print("  其中 weight_col_sum[k] = sum over all j of q2[k, j]")
+    print("\n[Inference 時使用方式]")
+    print("  q3[i,k] = ((acc[i,k] * M0[k]) >> n) + K[k]")
+    print("  其中 acc[i,k] = sum_j( q1[i,j] * q2[k,j] )  (純 int8 MAC)")
 
 
 # ==============================================================================
@@ -213,9 +346,9 @@ if __name__ == '__main__':
     parser.add_argument('--nbits',  type=int, default=8)
     args = parser.parse_args()
 
-    x = np.load(args.input).astype(np.float32)
+    x = np.load(args.input, allow_pickle=True).astype(np.float32)
     x = torch.tensor(x)
     if x.dim() == 3:
-        x = x.unsqueeze(0)   # add batch dim
+        x = x.unsqueeze(0)
 
     integer_forward(args.pth, x, args.outdir, args.nbits)

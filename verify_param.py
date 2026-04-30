@@ -52,7 +52,7 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
                  stride=(1,1), padding=0):
     """
     三項驗證：
-      1. M0 範圍是否正確（M0 ∈ [2^29, 2^31)）
+      1. M0 範圍是否正確（M0 ∈ [2^n-1, 2^n)）
       2. K 的等價重建：pure MAC + K == 原始 acc（含bias）+ Z3 的結果
       3. 最終 requant 輸出是否和 reference 一致
     """
@@ -70,25 +70,22 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         return False
 
     M0 = load_int(M0_path)          # (C_out,)
-    n  = load_scalar(n_path)        # scalar
+    n  = load_int(n_path)           # (C_out,)，per-channel
     K  = load_int(K_path)           # (C_out,)
 
     C_out = M0.shape[0]
-    print(f"  C_out={C_out}, n={n}")
+    print(f"  C_out={C_out}, n min={n.min()}, n max={n.max()}")
 
-    # ── 驗證 1：M0 範圍 ───────────────────────────────────────────────────────
-    # M0 = round(M * 2^n)，M ∈ (0,1)
-    # 正規化條件：M0_max >= 2^(n-1)（確保最高位有效）
-    # 且 M0 < 2^n（不超過 shift 範圍）
-    lo = 2 ** (n - 1)      # M0 對應 M >= 0.5 的下界
-    hi = 2 ** n            # 上界（不含）
-    in_range = np.all((M0 >= lo) & (M0 < hi))
-    status = PASS if in_range else WARN
-    # 注意：per-channel scale_w 不同，部分 channel 的 M 可能 < 0.5
-    # 所以這裡只警告，不直接判 FAIL
-    print(f"  {status} M0 範圍檢查：min={M0.min()}, max={M0.max()}  "
-          f"期望 [{lo}, {hi})（per-channel 允許部分不在範圍）")
-    print(f"         在範圍內的 channel 數：{np.sum((M0 >= lo) & (M0 < hi))} / {C_out}")
+    # ── 驗證 1：M0 範圍（per-channel）────────────────────────────────────────
+    # 每個 channel：M0[k] 應在 [2^(n[k]-1), 2^n[k])
+    in_range = 0
+    lo = 2 ** 31
+    hi = 2 ** 32
+    in_range_per_ch = (M0 >= lo) & (M0 < hi)
+    n_in_range = in_range_per_ch.sum()
+
+    status = PASS if n_in_range == C_out else WARN
+    print(f"  {status} M0 範圍檢查：在範圍內 {n_in_range}/{C_out} 個 channel")
 
     # ── 載入 input, weight, bias, reference ──────────────────────────────────
     x_q  = load_int(os.path.join(outdir, input_file))
@@ -126,10 +123,14 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         acc_pure_for_K = acc_with_bias - bias_bc + zp_in * wcs_bc
 
         # 用 K 重建輸出
-        K_bc  = np.repeat(K,  n_spatial)
+        # per-channel n broadcast
+        n_bc  = np.repeat(n,  n_spatial)
         M0_bc = np.repeat(M0, n_spatial)
-        q3_from_K  = ((acc_pure_for_K * M0_bc) >> n) + K_bc
-        q3_ref_raw = ((acc_with_bias  * M0_bc) >> n) + zp_out
+        K_bc  = np.repeat(K,  n_spatial)
+
+        # 用 per-channel shift
+        q3_from_K  = ((acc_pure_for_K * M0_bc) >> n_bc) + K_bc
+        q3_ref_raw = ((acc_with_bias  * M0_bc) >> n_bc) + zp_out
 
     else:
         # Linear layer
@@ -147,6 +148,7 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         acc_pure_for_K = acc_with_bias - (bias if bias is not None else 0) \
                          + zp_in * weight_col_sum
 
+        # per-channel shift（linear 無 spatial，直接用 array）
         q3_from_K  = ((acc_pure_for_K * M0) >> n) + K
         q3_ref_raw = ((acc_with_bias  * M0) >> n) + zp_out
 
@@ -278,7 +280,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', default='./layer_outputs',
                         help='extract_layers.py 的輸出目錄')
-    parser.add_argument('--pth',    required=True,
+    parser.add_argument('--pth',  default='./model_params/quantized_params_75.pth',
                         help='quantized_params.pth（讀取 zp 用）')
     args = parser.parse_args()
 

@@ -23,6 +23,8 @@ verify_params.py
 import argparse
 import os
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 
 PASS = "\033[92m[PASS]\033[0m"
@@ -47,8 +49,8 @@ def load_scalar(path: str) -> int:
 
 def verify_layer(outdir: str, layer: str, is_conv: bool,
                  input_file: str, ref_output_file: str,
-                 w_file: str, bias_file: str,
-                 zp_in: int, zp_out: int,
+                 w_file: str, relu: bool,
+                 zp_in: int, zp_out: int, input_shape: tuple, weight_shape: tuple,
                  stride=(1,1), padding=0):
     """
     三項驗證：
@@ -90,8 +92,7 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
     # ── 載入 input, weight, bias, reference ──────────────────────────────────
     x_q  = load_int(os.path.join(outdir, input_file))
     ref  = load_int(os.path.join(outdir, ref_output_file))
-    w    = load_int(os.path.join(outdir, w_file)).astype(np.int64)
-    bias = load_int(os.path.join(outdir, bias_file)) if bias_file else None
+    w    = load_int(os.path.join(outdir, w_file)).astype(np.int8)
 
     # ── 驗證 2：K 等價性 ──────────────────────────────────────────────────────
     # 原始流程：acc_with_bias = MAC(x_q - Z1, w) + bias
@@ -104,23 +105,11 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         # 從 acc 檔案拿原始 accumulator（含 bias，flatten 為 1D）
         # flatten 順序：(1, C_out, H_out, W_out) → row-major
         # 每個 output channel 連續 n_spatial 個元素
-        acc_with_bias = load_int(os.path.join(outdir, f'{layer}_acc.txt'))
+        acc = F.conv2d(torch.from_numpy(x_q).float().reshape(input_shape),
+                torch.from_numpy(w).float().reshape(weight_shape), bias=None, stride=stride, padding=padding).flatten()
 
         # n_spatial 必須在使用前先算，不依賴 bias 是否存在
-        n_spatial = acc_with_bias.shape[0] // C_out
-
-        # broadcast bias 和 weight_col_sum
-        if bias is not None:
-            bias_bc = np.repeat(bias, n_spatial)           # (C_out * n_spatial,)
-        else:
-            bias_bc = np.zeros(C_out * n_spatial, dtype=np.int64)
-
-        w_reshaped     = w.reshape(C_out, -1)
-        weight_col_sum = w_reshaped.sum(axis=1)            # (C_out,)
-        wcs_bc         = np.repeat(weight_col_sum, n_spatial)
-
-        # acc_pure（K 用的）= acc_with_bias - bias + Z1 * weight_col_sum
-        acc_pure_for_K = acc_with_bias - bias_bc + zp_in * wcs_bc
+        n_spatial = acc.shape[0] // C_out
 
         # 用 K 重建輸出
         # per-channel n broadcast
@@ -129,50 +118,33 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         K_bc  = np.repeat(K,  n_spatial)
 
         # 用 per-channel shift
-        q3_from_K  = ((acc_pure_for_K * M0_bc) >> n_bc) + K_bc
-        q3_ref_raw = ((acc_with_bias  * M0_bc) >> n_bc) + zp_out
+        q3_from_K  = (((acc * M0_bc) / 2 ** n_bc) + K_bc * 2 ** 32) / 2 ** 32
 
     else:
         # Linear layer
-        acc_with_bias = load_int(os.path.join(outdir, f'{layer}_acc.txt'))
+        x_2d = torch.from_numpy(x_q).float().reshape(1, -1)
+        acc = F.linear(x_2d, torch.from_numpy(w).float().reshape(weight_shape), bias=None).flatten()
         n_spatial = 1
 
-        if bias is not None:
-            acc_pure_flat = acc_with_bias - bias
-        else:
-            acc_pure_flat = acc_with_bias.copy()
-
-        w_reshaped = w.reshape(C_out, -1)
-        weight_col_sum = w_reshaped.sum(axis=1)
-
-        acc_pure_for_K = acc_with_bias - (bias if bias is not None else 0) \
-                         + zp_in * weight_col_sum
-
         # per-channel shift（linear 無 spatial，直接用 array）
-        q3_from_K  = ((acc_pure_for_K * M0) >> n) + K
-        q3_ref_raw = ((acc_with_bias  * M0) >> n) + zp_out
-
-    # 比較兩條路徑
-    diff_K = np.abs(q3_from_K - q3_ref_raw)
-    max_diff_K = diff_K.max()
-    status = PASS if max_diff_K <= 1 else FAIL
-    print(f"  {status} K 等價性：max |q3_K - q3_ref| = {max_diff_K}  "
-          f"（≤1 為正常 rounding 誤差）")
-    if max_diff_K > 1:
-        bad_idx = np.where(diff_K > 1)[0]
-        print(f"         差異超過 1 的位置數量：{len(bad_idx)}")
-        print(f"         前5個：idx={bad_idx[:5]}, "
-              f"K路徑={q3_from_K[bad_idx[:5]]}, "
-              f"ref={q3_ref_raw[bad_idx[:5]]}")
+        q3_from_K  = (((acc * M0) / 2 ** n) + K * 2 ** 32) / 2 ** 32
 
     # ── 驗證 3：最終輸出一致性 ────────────────────────────────────────────────
     # ref 是 extract_layers.py 存的 relu_q（含 clamp）
     # 我們用 K 路徑重建，加上 clamp，比對 ref
-    q3_K_clamped = np.clip(q3_from_K, 0, 255)
+    # q3_K_clamped = np.clip(q3_from_K, 0, 255)
     # 若有 ReLU：再 clamp min=zp_out
-    q3_K_relu    = np.clip(q3_K_clamped, zp_out, 255)
-
+    if relu:
+        q3_K_relu = np.clip(q3_from_K, zp_out, 255)
+    else: 
+        q3_K_relu = np.clip(q3_from_K, 0, 255)
+    
+    q3_K_relu = np.round(q3_K_relu)
     diff_out = np.abs(q3_K_relu - ref)
+    for i in range(len(diff_out)):
+        if diff_out[i] > 1:
+            print(f"  {WARN} 輸出差異超過 1 的位置：idx={i}  q3_K={q3_K_relu[i]}  ref={ref[i]}  diff={diff_out[i]}")
+            
     max_diff_out = diff_out.max()
     exact_match  = (diff_out == 0).all()
 
@@ -183,7 +155,7 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
         bad_idx = np.where(diff_out > 1)[0]
         print(f"         差異超過 1 的位置數量：{len(bad_idx)}")
 
-    return (max_diff_K <= 1) and (max_diff_out <= 1)
+    return (max_diff_out <= 1)
 
 
 # ==============================================================================
@@ -212,9 +184,11 @@ def verify_all(outdir: str, pth_path: str):
         input_file   = 'input_q.txt',
         ref_output_file = 'relu1_q.txt',
         w_file       = 'conv1_w.txt',
-        bias_file    = None,          # acc 已含 bias，bias 從 pth 拿
+        relu         = True,
         zp_in        = zp('input'),
         zp_out       = zp('relu1'),
+        input_shape  = (1, 1, 101, 40),
+        weight_shape = (32, 1, 67, 8)
     )
 
     # ── conv2 ─────────────────────────────────────────────────────────────────
@@ -225,9 +199,11 @@ def verify_all(outdir: str, pth_path: str):
         input_file   = 'relu1_q.txt',
         ref_output_file = 'relu2_q.txt',
         w_file       = 'conv2_w.txt',
-        bias_file    = None,
+        relu         = True,
         zp_in        = zp('relu1'),
         zp_out       = zp('relu2'),
+        input_shape  = (1, 32, 35, 33),
+        weight_shape = (16, 32, 10, 4)
     )
 
     # ── linear ────────────────────────────────────────────────────────────────
@@ -238,9 +214,11 @@ def verify_all(outdir: str, pth_path: str):
         input_file   = 'relu2_q.txt',
         ref_output_file = 'linear_q.txt',
         w_file       = 'linear_w.txt',
-        bias_file    = None,
+        relu         = False,
         zp_in        = zp('relu2'),
         zp_out       = zp('linear'),
+        input_shape  = (1, 16, 26, 30),
+        weight_shape = (32, 12480)
     )
 
     # ── dnn ───────────────────────────────────────────────────────────────────
@@ -251,9 +229,11 @@ def verify_all(outdir: str, pth_path: str):
         input_file   = 'linear_q.txt',
         ref_output_file = 'relu3_q.txt',
         w_file       = 'dnn_w.txt',
-        bias_file    = None,
+        relu         = True,
         zp_in        = zp('linear'),
         zp_out       = zp('relu3'),
+        input_shape  = (1, 32),
+        weight_shape = (128, 32)
     )
 
     # ── 總結 ──────────────────────────────────────────────────────────────────

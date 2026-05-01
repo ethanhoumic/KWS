@@ -97,7 +97,7 @@ def prune_linear_in(linear: nn.Linear, keep_idx: torch.Tensor,
 
 def prune_cnntrad(model: CNNTradFpool3,
                   prune_ratio_conv1: float = 0.5,
-                  prune_ratio_conv2: float = 0.5,
+                  prune_ratio_conv2: float = 0.75,
                   input_shape: tuple = (1, 1, 101, 40)) -> CNNTradFpool3:
     """
     Perform L1-norm channel pruning on CNNTradFpool3.

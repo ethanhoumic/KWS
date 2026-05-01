@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from training_code.model import CNNTradFpool3
+from model import CNNTradFpool3
 
 # ====================================================================================
 #                                sample prepare
@@ -428,10 +428,10 @@ def main():
     )
     
     trainer = Trainer(model, train_loader, val_loader, device=device)
-    history = trainer.train(num_epochs=50, save_path='best_cnn_trad_no_pool_model.pth', patience=25)
+    history = trainer.train(num_epochs=50, save_path='best_cnn_trad_sigmoid.pth', patience=25)
     tester = Tester(model, test_loader, device=device)
     
-    trainer.plot_history(figure_path='training_history_trad_no_pool.png')
+    trainer.plot_history(figure_path='training_history_trad_sigmoid.png')
     print('\n' + '='*60)
     print('Evaluating on test set...')
     test_acc = tester.test()

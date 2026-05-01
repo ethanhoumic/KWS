@@ -27,7 +27,7 @@ class CNNTradFpool3(nn.Module):
             bias=True
         )
         
-        self.relu1 = nn.ReLU(inplace=True)
+        self.sigmoid1 = nn.Sigmoid()
         
         self.conv2 = nn.Conv2d(
             in_channels=64, 
@@ -38,7 +38,7 @@ class CNNTradFpool3(nn.Module):
             bias=True
         )
         
-        self.relu2 = nn.ReLU(inplace=True)
+        self.sigmoid2 = nn.Sigmoid()
         
         self.dropout = nn.Dropout(p=dropout_rate)
         
@@ -47,7 +47,7 @@ class CNNTradFpool3(nn.Module):
         self.linear = nn.Linear(self._conv_out_dim, 32, bias=True)
         
         self.dnn = nn.Linear(32, 128, bias=True)
-        self.relu3 = nn.ReLU(inplace=True)
+        self.sigmoid3 = nn.Sigmoid()
         
         self.classifier = nn.Linear(128, num_classes, bias=True)
         
@@ -57,10 +57,10 @@ class CNNTradFpool3(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 1, 101, 40)
             conv1 = self.conv1(dummy)
-            relu1 = self.relu1(conv1)
-            conv2 = self.conv2(relu1)
-            relu2 = self.relu2(conv2)
-            return relu2.view(1, -1).shape[1]
+            sigmoid1 = self.sigmoid1(conv1)
+            conv2 = self.conv2(sigmoid1)
+            sigmoid2 = self.sigmoid2(conv2)
+            return sigmoid2.view(1, -1).shape[1]
     
     def _initialize_weight(self):
         for layer in self.modules():
@@ -76,17 +76,17 @@ class CNNTradFpool3(nn.Module):
         if x.dim() == 3 :
             x = x.unsqueeze(1)
         x = self.conv1(x)
-        x = self.relu1(x)
+        x = self.sigmoid1(x)
         
         x = self.conv2(x)
-        x = self.relu2(x)
+        x = self.sigmoid2(x)
         
         x = x.view(x.size(0), -1)
         
         x = self.linear(x)
         x = self.dropout(x)
         x = self.dnn(x)
-        x = self.relu3(x)
+        x = self.sigmoid3(x)
         x = self.dropout(x)
         
         logits = self.classifier(x)

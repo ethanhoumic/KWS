@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from training_code.model import CNNTradFpool3
+from model import CNNTradFpool3
 
 
 # =============================================================================
@@ -128,9 +128,9 @@ def prune_cnntrad(model: CNNTradFpool3,
     with torch.no_grad():
         dummy = torch.zeros(*input_shape)
         x = model.conv1(dummy)
-        x = model.relu1(x)
+        x = model.sigmoid1(x)
         x = model.conv2(x)
-        x = model.relu2(x)
+        x = model.sigmoid2(x)
         spatial_size = x.shape[2] * x.shape[3]   # H_out * W_out
 
     print(f"conv2 spatial size : {spatial_size}")
@@ -158,27 +158,27 @@ def _build_pruned_model(orig, new_conv1, new_conv2, new_linear):
         def __init__(self):
             super().__init__()
             self.conv1     = new_conv1
-            self.relu1     = orig.relu1
+            self.sigmoid1  = orig.sigmoid1
             self.conv2     = new_conv2
-            self.relu2     = orig.relu2
+            self.sigmoid2  = orig.sigmoid2
             self.dropout   = orig.dropout
             self.linear    = new_linear
             self.dnn       = orig.dnn
-            self.relu3     = orig.relu3
+            self.sigmoid3     = orig.sigmoid3
             self.classifier = orig.classifier
 
         def forward(self, x):
             if x.dim() == 3:
                 x = x.unsqueeze(1)
             x = self.conv1(x)
-            x = self.relu1(x)
+            x = self.sigmoid1(x)
             x = self.conv2(x)
-            x = self.relu2(x)
+            x = self.sigmoid2(x)
             x = x.view(x.size(0), -1)
             x = self.linear(x)
             x = self.dropout(x)
             x = self.dnn(x)
-            x = self.relu3(x)
+            x = self.sigmoid3(x)
             x = self.dropout(x)
             x = self.classifier(x)
             return x

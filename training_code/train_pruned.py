@@ -10,8 +10,8 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from training_code.model import CNNTradFpool3
-from training_code.pruning import prune_cnntrad, count_params, verify_output_shape
+from model import CNNTradFpool3
+from pruning import prune_cnntrad, count_params, verify_output_shape
 
 # ====================================================================================
 #                               Configuration
@@ -19,9 +19,9 @@ from training_code.pruning import prune_cnntrad, count_params, verify_output_sha
 
 CFG = dict(
     data_dir        = './archive',
-    pretrained_ckpt = 'best_cnn_trad_no_pool_model.pth',  # set '' to skip loading
-    save_path       = 'pruned_cosinelr_75.pth',
-    figure_path     = 'training_history_pruned_cosinelr_75.png',
+    pretrained_ckpt = 'best_cnn_trad_sigmoid.pth',  # set '' to skip loading
+    save_path       = 'pruned_cosinelr_75_sigmoid.pth',
+    figure_path     = 'training_history_pruned_cosinelr_75_sigmoid.png',
 
     # Pruning ratios (fraction of channels to REMOVE)
     prune_ratio_conv1 = 0.5,

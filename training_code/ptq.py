@@ -13,8 +13,8 @@ import random
 #                               Config
 # ====================================================================================
 
-PRUNED_CKPT       = 'pruned_cosinelr_75_sigmoid.pth'
-OUTPUT_NPZ        = 'quantized_params_75_sigmoid.npz'
+PRUNED_CKPT       = 'pruned_cosinelr_75_relu.pth'
+OUTPUT_NPZ        = 'quantized_params_75_relu.npz'
 N_CALIB           = 1000          # calibration 樣本數
 BATCH_SIZE        = 100
 NUM_BITS          = 8
@@ -198,10 +198,10 @@ def ptq(model, calib_loader, device,
         n_bits=8, percentile=99.99, output_npz='quantized_params.npz'):
 
     layer_names = [
-        'sigmoid1',        # conv1 → sigmoid1 : input act of conv2
-        'sigmoid2',        # conv2 → sigmoid2 : input act of linear
+        'relu1',        # conv1 → relu1 : input act of conv2
+        'relu2',        # conv2 → relu2 : input act of linear
         'linear',       # linear output  : input act of dnn
-        'sigmoid3',        # dnn   → sigmoid3  : input act of classifier
+        'relu3',        # dnn   → relu3  : input act of classifier
         'classifier',   # final logits
     ]
 
@@ -235,10 +235,10 @@ def ptq(model, calib_loader, device,
 
     layers_info = {
         'conv1':      (model.conv1,      'input'),
-        'conv2':      (model.conv2,      'sigmoid1'),
-        'linear':     (model.linear,     'sigmoid2'),
+        'conv2':      (model.conv2,      'relu1'),
+        'linear':     (model.linear,     'relu2'),
         'dnn':        (model.dnn,        'linear'),
-        'classifier': (model.classifier, 'sigmoid3'),
+        'classifier': (model.classifier, 'relu3'),
     }
 
     weight_quant = {}
@@ -342,24 +342,24 @@ def fake_quant_forward(model, act_quant, weight_quant, data, n_bits=8):
     x = nn.functional.conv2d(x, w, b,
                               stride=model.conv1.stride,
                               padding=model.conv1.padding)
-    x = nn.functional.sigmoid(x)
-    x = quant_deq_act(x, 'sigmoid1')
+    x = nn.functional.relu(x)
+    x = quant_deq_act(x, 'relu1')
 
     # conv2
     w = dequant_w('conv2')
-    b = dequant_b('conv2', act_quant['sigmoid1']['scale'])
+    b = dequant_b('conv2', act_quant['relu1']['scale'])
     x = nn.functional.conv2d(x, w, b,
                               stride=model.conv2.stride,
                               padding=model.conv2.padding)
-    x = nn.functional.sigmoid(x)
-    x = quant_deq_act(x, 'sigmoid2')
+    x = nn.functional.relu(x)
+    x = quant_deq_act(x, 'relu2')
 
     # flatten
     x = x.view(x.size(0), -1)
 
     # linear
     w = dequant_w('linear')
-    b = dequant_b('linear', act_quant['sigmoid2']['scale'])
+    b = dequant_b('linear', act_quant['relu2']['scale'])
     x = nn.functional.linear(x, w, b)
     x = quant_deq_act(x, 'linear')
 
@@ -367,12 +367,12 @@ def fake_quant_forward(model, act_quant, weight_quant, data, n_bits=8):
     w = dequant_w('dnn')
     b = dequant_b('dnn', act_quant['linear']['scale'])
     x = nn.functional.linear(x, w, b)
-    x = nn.functional.sigmoid(x)
-    x = quant_deq_act(x, 'sigmoid3')
+    x = nn.functional.relu(x)
+    x = quant_deq_act(x, 'relu3')
 
     # classifier
     w = dequant_w('classifier')
-    b = dequant_b('classifier', act_quant['sigmoid3']['scale'])
+    b = dequant_b('classifier', act_quant['relu3']['scale'])
     x = nn.functional.linear(x, w, b)
 
     return x

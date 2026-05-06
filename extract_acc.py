@@ -9,9 +9,10 @@ from training_code.pruning import prune_cnntrad
 from training_code.train_pruned import CFG
 import os
 
-OUTPUT_DIR = './acc_preact'
-INPUT_NPY  = './input_sample.npy'
-PTH_PATH   = './model_params/quantized_params_75.pth'
+OUTPUT_DIR = './acc_preact_sigmoid'
+INPUT_PATH  = './layer_outputs_sigmoid/linear_q.txt'
+WEIGHT_PATH = './layer_outputs_sigmoid/dnn_w.txt'
+PTH_PATH   = './model_params/quantized_params_75_sigmoid.pth'
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -29,6 +30,9 @@ model = prune_cnntrad(model,
                       prune_ratio_conv1=CFG['prune_ratio_conv1'],
                       prune_ratio_conv2=CFG['prune_ratio_conv2'])
 model.eval()
+
+def load_int(path: str) -> np.ndarray:
+    return np.loadtxt(path, dtype=np.int64)
 
 # --- 輔助函數 ---
 def dequant_w(lname):
@@ -60,16 +64,17 @@ def save_txt(arr: np.ndarray, path: str):
 
 # --- Forward，手動在每層 activation 前存值 ---
 # x = torch.from_numpy(np.load(INPUT_NPY)).float()
-x = torch.from_numpy(np.load(INPUT_NPY)).int()
-
+x = torch.from_numpy(load_int(INPUT_PATH))
+w = torch.from_numpy(load_int(WEIGHT_PATH))
+x = x.reshape(1, -1)
+w = w.reshape(model.dnn.weight.shape)
 # input quantize
 # x = quant_deq_act(x, 'input')
 
-# conv1 → 存 preact → relu → quantize
-w = weight_quant['conv1']['w_int'].int()
-acc = nn.functional.conv2d(x.float(), w.float(), stride=model.conv1.stride, padding=model.conv1.padding)
+# linear → 存 preact → quantize
+acc = nn.functional.linear(x.float(), w.float(), None)
 acc = acc.round().int()  
-save_txt(acc.detach().numpy(), os.path.join(OUTPUT_DIR, 'conv1_acc.txt'))
+save_txt(acc.detach().numpy(), os.path.join(OUTPUT_DIR, 'dnn_acc_sigmoid.txt'))
 
 # w = dequant_w('conv1')
 # b = dequant_b('conv1', act_quant['input']['scale'])

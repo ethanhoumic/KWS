@@ -141,9 +141,9 @@ def verify_layer(outdir: str, layer: str, is_conv: bool,
     
     q3_K_relu = np.round(q3_K_relu)
     diff_out = np.abs(q3_K_relu - ref)
-    for i in range(len(diff_out)):
-        if diff_out[i] > 1:
-            print(f"  {WARN} 輸出差異超過 1 的位置：idx={i}  q3_K={q3_K_relu[i]}  ref={ref[i]}  diff={diff_out[i]}")
+    # for i in range(len(diff_out)):
+    #     if diff_out[i] > 1:
+    #         print(f"  {WARN} 輸出差異超過 1 的位置：idx={i}  q3_K={q3_K_relu[i]}  ref={ref[i]}  diff={diff_out[i]}")
             
     max_diff_out = diff_out.max()
     exact_match  = (diff_out == 0).all()

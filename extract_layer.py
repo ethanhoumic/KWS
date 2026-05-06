@@ -46,6 +46,11 @@ def save_txt(arr: np.ndarray, path: str):
     np.savetxt(path, arr.flatten(), fmt='%.16f' if arr.dtype == np.float32 else '%d')
     print(f"  saved {path}  shape={arr.shape}  range=[{arr.min()}, {arr.max()}]")
 
+def save_zp(zp: int, path: str):
+    """儲存 zero-point（純 scalar）"""
+    with open(path, 'w') as f:
+        f.write(str(zp))
+    print(f"  saved {path}  zero_point={zp}")
 
 # ==============================================================================
 #  離線參數計算：M0, n, K
@@ -202,10 +207,12 @@ def integer_forward(pth_path: str, pruned_pth_path: str,
         ('conv2',  'relu1',   'relu2',  model.conv2),
         ('linear', 'relu2',   'linear', model.linear),
         ('dnn',    'linear',  'relu3',  model.dnn),
+        ('classifier', 'relu3', 'classifier', model.classifier)
     ]
     for lname, in_name, out_name, module in layer_params:
         s_in_l,  zp_in_l  = aq(in_name)
         s_out_l, zp_out_l = aq(out_name)
+        save_zp(zp_out_l, os.path.join(outdir, f'{lname}_zp_out.txt'))
         q = wq[lname]
         M0, n, K = compute_offline_params(
             s_in=s_in_l, scale_w=q['scale_w'].numpy(),
@@ -255,7 +262,6 @@ def integer_forward(pth_path: str, pruned_pth_path: str,
     quantize_and_save('relu2_out',  'relu2',  'relu2_q.txt')
     quantize_and_save('linear_out', 'linear', 'linear_q.txt')
     quantize_and_save('relu3_out',  'relu3',  'relu3_q.txt')
- 
  
     # classifier 不量化，存 float logits
     save_txt(layer_outputs['classifier_out'].numpy(),

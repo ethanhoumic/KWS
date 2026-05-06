@@ -61,7 +61,7 @@ class CNNTradFpool3(nn.Module):
             conv2 = self.conv2(sigmoid1)
             sigmoid2 = self.sigmoid2(conv2)
             return sigmoid2.view(1, -1).shape[1]
-    
+
     def _initialize_weight(self):
         for layer in self.modules():
             if isinstance(layer, nn.Conv2d):

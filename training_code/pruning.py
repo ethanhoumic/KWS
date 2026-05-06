@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model import CNNTradFpool3
+from training_code.model import CNNTradFpool3
 
 
 # =============================================================================

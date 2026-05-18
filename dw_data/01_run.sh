@@ -1,0 +1,1 @@
+vcs -R -full64 -f rtl.f -debug_access+all

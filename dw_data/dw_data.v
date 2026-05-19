@@ -21,18 +21,18 @@ module tb;
     );
 
     // ── DW_div ────────────────────────────────────────────────────────
-    reg  [23:0] b;
+    reg  [31:0] b;
     wire [32:0] quotient;
 
     DW_div #(
         .a_width(33),
-        .b_width(24),
+        .b_width(32),
         .tc_mode(1'b0),
         .rem_mode(1'b1)
     ) u_dw_div (
-        .a(33'h100000000),
-        .b(b),
-        .quotient(quotient), // Q1.32
+        .a(33'h100000000), // Q1.32
+        .b(b),             // Q17.15
+        .quotient(quotient), // Q16.17
         .remainder()
     );
 
@@ -74,28 +74,27 @@ module tb;
 
             int_mag = (int_signed < 0) ? -int_signed : int_signed;
 
-            // ── 送 DW_exp2：frac 左移 8-bit 對齊 Q0.16 ───────────────
-            a = {frac_part, 8'b0};
-            #5;
-
-            // ── 移位得到 2^{±p} ───────────────────────────────────────
-            if (i < 0) temp = ({16'b0, z} >> int_mag); // Q17.15
-            else       temp = ({16'b0, z} << int_mag); // Q17.15, worst case = 1 << 12 = 13 integer bits
-
-            // truncate to Q15.8
-
-            temp_2 = (temp[6]) ? (temp[29:7] + 1) : temp[29:7];
-
-            // ── 除法器：b = Q16.8 ──────────────────────────────
-            b = temp_2 + 24'h000100;
-            #10;
-            if (quotient[32] === 1'b1) begin
-                $display("[ERROR]: Sigmoid exceeds 1");
-            end
-            // ── 輸出 Q0.32 ────────────────────────────────────────────
             if (i > 0 && int_signed > 12) $fdisplay(fd, "%0d %0d", i, 0);
-            else if (i < 0 && int_signed <= -12) $fdisplay(fd, "%0d %0d", i, 32'hFFFFFFFF);
-            else $fdisplay(fd, "%0d %0d", i, quotient[31:0]);
+            else if (i < 0 && int_signed <= -12) $fdisplay(fd, "%0d %0d", i, 16'hFFFF);
+            else begin
+
+                // ── 送 DW_exp2：frac 左移 8-bit 對齊 Q0.16 ───────────────
+                a = {frac_part, 8'b0};
+                #5;
+
+                // ── 移位得到 2^{±p} ───────────────────────────────────────
+                if (i < 0) temp = ({16'b0, z} >> int_mag); // Q17.15
+                else       temp = ({16'b0, z} << int_mag); // Q17.15, worst case = 1 << 12 = 13 integer bits
+
+                b = temp + 32'h00008000;
+                #10;
+                if (quotient[32:17] !== 16'd0) begin
+                    $display("[ERROR]: Sigmoid exceeds 1");
+                end
+                // ── 輸出 Q0.16 ────────────────────────────────────────────
+                temp_2 = (quotient[0]) ? (quotient[16:1] + 1) : quotient[16:1];
+                $fdisplay(fd, "%0d %0d", i, temp_2);
+            end
         end
 
         $fclose(fd);

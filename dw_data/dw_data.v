@@ -7,7 +7,7 @@ module tb;
     wire [15:0] z;
     reg signed [7:0] int_signed;
     reg [7:0]  int_mag;
-    reg [7:0]  frac_part;
+    reg [15:0]  frac_part;
     reg [31:0] temp;
     reg [23:0] temp_2;
 
@@ -55,22 +55,17 @@ module tb;
         end
 
         $fdisplay(fd, "# sigmoid lookup table");
-        $fdisplay(fd, "# input : i (signed, Q5.8)");
+        $fdisplay(fd, "# input : i (signed, Q5.12)");
         $fdisplay(fd, "# output: quotient (Q0.16))");
 
-        for (i = -8192; i < 8192; i = i + 1) begin
+        for (i = -2097152; i < 2097152; i = i + 1) begin
             #10;
-            if (i % 500 == 0)
+            if (i % 100000 == 0)
                 $display("Processing i = %0d", i);
 
             // ── 拆整數和小數部分 ──────────────────────────────────────
-            int_signed = i >>> 8;
-            frac_part = i[7:0];
-
-            if (i < 0 && frac_part != 0) begin
-                int_signed = int_signed - 1;
-                frac_part = 12'h100 - frac_part;
-            end
+            int_signed = i >>> 16;
+            frac_part = i[15:0];
 
             int_mag = (int_signed < 0) ? -int_signed : int_signed;
 
@@ -78,8 +73,8 @@ module tb;
             else if (i < 0 && int_signed <= -12) $fdisplay(fd, "%0d %0d", i, 16'hFFFF);
             else begin
 
-                // ── 送 DW_exp2：frac 左移 8-bit 對齊 Q0.16 ───────────────
-                a = {frac_part, 8'b0};
+                // ── 送 DW_exp2 ───────────────
+                a = frac_part;
                 #5;
 
                 // ── 移位得到 2^{±p} ───────────────────────────────────────

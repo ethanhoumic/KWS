@@ -6,15 +6,23 @@ extract_layers.py
 把每層的量化整數輸出存成 .txt（一個數字一行），
 供 C model 比對用。
 
-同時提取每層的離線參數：
-  K^(k)  = Z3 + M * (q_bias^(k) - Z1 * sum_j(q2^(j,k)))   [per output channel, int64]
-  M0^(k) = round(M^(k) * 2^n)                               [per output channel, int64]
-  n      = shift amount                                      [scalar, int]
+離線參數分兩種：
+
+[一般層：linear, classifier]
+  M0^(k) = round(M^(k) * 2^n),   M = s_in * s_w / s_out
+  K^(k)  = Z3 + round(M^(k) * (q_bias^(k) - Z1 * wcs^(k)))
+  n^(k)  = shift amount
+
+[sigmoid 前層：conv1, conv2, dnn]
+  M0\'(k) = round(s_in * s_w^(k) * 1.44269 * 2^n\'^(k))
+  K\'(k)  = -round(s_in * s_w^(k) * 1.44269 * (q_bias^(k) - Z1 * wcs^(k)))
+  n\'^(k)  = shift amount
+  （s_out 和 Z3 已抵消，不需要傳入）
 
 儲存格式（每層）：
-  {layer}_M0.txt   : C_out 個 int64，順序 = output channel 0, 1, ..., C_out-1
-  {layer}_n.txt    : 1 個 int，scalar
-  {layer}_K.txt    : C_out 個 int64，順序 = output channel 0, 1, ..., C_out-1
+  {layer}_M0.txt   : C_out 個 int64
+  {layer}_n.txt    : C_out 個 int64
+  {layer}_K.txt    : C_out 個 int64
 
 用法：
     python extract_layers.py
@@ -73,51 +81,24 @@ def compute_offline_params(
     total_bits: int = 31
 ):
     """
-    計算每層的離線參數 M0, n, K。
+    一般層（linear, classifier）的離線參數 M0, n, K。
 
-    符號對應（依照推導）：
-        q1 = activation (input)，非對稱，zero-point = Z1 = zp_in
-        q2 = weight，對稱，Z2 = 0
-        q3 = output activation，非對稱，zero-point = Z3 = zp_out
-
-    公式（全部 per output channel）：
-        M^(k)  = s_in * scale_w^(k) / s_out
-        n^(k)  = 讓 M^(k) * 2^n^(k) 落在 [0.5, 1) 的 shift 量
-        M0^(k) = round(M^(k) * 2^n^(k))，保證 M0 ∈ [2^(total_bits-1), 2^total_bits)
-
-        K^(k) = Z3 + round( M^(k) * (q_bias^(k) - Z1 * weight_col_sum^(k)) )
-        （直接 FP 乘法，離線不需省運算）
-
-    回傳：
-        M0 : np.ndarray, shape (C_out,), dtype int64
-        n  : np.ndarray, shape (C_out,), dtype int64   ← per-channel
-        K  : np.ndarray, shape (C_out,), dtype int64
+    M^(k)  = s_in * scale_w^(k) / s_out
+    K^(k)  = Z3 + round(M^(k) * (q_bias^(k) - Z1 * wcs^(k)))
     """
 
     # ── M per output channel ──────────────────────────────────────────────────
     M = (s_in * scale_w) / s_out                           # (C_out,), float64
 
     # ── n per output channel：對每個 channel 各自正規化 ──────────────────────
-    # 找最小的 n 使 M * 2^n >= 2^(total_bits-1)（即正規化後 >= 0.5）
     n = np.zeros(len(M), dtype=np.int64)
     for idx, m in enumerate(M):
         while m * (2 ** int(n[idx])) < 0.5:
             n[idx] += 1
 
     # ── M0 per output channel ─────────────────────────────────────────────────
-    M0 = np.zeros(len(M), dtype=np.uint32)
-    temp = M * (2 ** n)                                      # (C_out,), float64
-    for i in range(len(M)):
-        val = temp[i]
-        m0 = 0
-        for _ in range(32):
-            val *= 2
-            m0 *= 2          # m0 *= 2
-            if val >= 1.0:
-                val -= 1.0
-                m0 += 1       # m0 += 1
-
-        M0[i] = m0
+        
+    M0 = np.round(M * 2 ** (n + 32)).astype(np.uint32)
 
     # ── weight column sum per output channel ─────────────────────────────────
     w_flat = w_int.reshape(w_int.shape[0], -1)              # (C_out, N)
@@ -129,9 +110,57 @@ def compute_offline_params(
     else:
         b_int_arr = b_int.astype(np.float64)                # (C_out,)
 
-    # ── K per output channel（FP 乘法）───────────────────────────────────────
+    # ── K per output channel ─────────────────────────────────────────────────
     correction = b_int_arr - float(zp_in) * weight_col_sum.astype(np.float64)
-    K = np.round(float(zp_out) + M * correction).astype(np.int32)  # (C_out,)
+    K = np.round(float(zp_out) + M * correction).astype(np.int64)
+
+    return M0, n, K
+
+
+def compute_offline_params_sigmoid(
+    s_in:     float,          # 輸入 activation scale (scalar)
+    scale_w:  np.ndarray,     # weight scale, shape (C_out,)，per-channel
+    zp_in:    int,            # 輸入 activation zero-point Z1 (scalar)
+    w_int:    np.ndarray,     # 量化後的 weight，shape (C_out, ...)，int8
+    b_int:    np.ndarray,     # 量化後的 bias，shape (C_out,)，int32
+):
+    """
+    sigmoid 前層（conv1, conv2, dnn）的離線參數 M0\'，n\'，K\'。
+
+    s_out 和 Z3 已在推導中抵消，不需要傳入。
+
+    M\'^(k)  = s_in * scale_w^(k) * 1.44269
+    K\'^(k)  = -round(M\'^(k) * (q_bias^(k) - Z1 * wcs^(k)))
+    n\'^(k)  = 正規化 shift
+    """
+    LOG2E = 1.44269504088896
+
+    # ── M' per output channel ─────────────────────────────────────────────────
+    M = s_in * scale_w * LOG2E                              # (C_out,), float64
+
+    # ── n' per output channel（沿用相同正規化 loop）──────────────────────────
+    n = np.zeros(len(M), dtype=np.int64)
+    for idx, m in enumerate(M):
+        while m * (2 ** int(n[idx])) < 0.5:
+            n[idx] += 1
+
+    # ── M0' per output channel ───────────────────────────────────────────────
+    
+    M0 = np.round(M * 2 ** (n + 32)).astype(np.uint32)
+
+    # ── weight column sum per output channel ─────────────────────────────────
+    w_flat = w_int.reshape(w_int.shape[0], -1)
+    weight_col_sum = w_flat.sum(axis=1).astype(np.int32)
+
+    # ── bias ──────────────────────────────────────────────────────────────────
+    if b_int is None:
+        b_int_arr = np.zeros(w_int.shape[0], dtype=np.float64)
+    else:
+        b_int_arr = b_int.astype(np.float64)
+
+    # ── K' per output channel（注意負號）────────────────────────────────────
+    correction = b_int_arr - float(zp_in) * weight_col_sum.astype(np.float64)
+    K = np.round(M * correction).astype(np.int64)
 
     return M0, n, K
 
@@ -210,14 +239,59 @@ def integer_forward(pth_path: str, pruned_pth_path: str,
     # out_name 是 MAC 輸出 requantize 的目標：
     #   conv/dnn 後接 sigmoid → requantize 到 sigmoid 輸入的 scale（act_quant['conv1'] 等）
     #   linear/classifier 後無 sigmoid → requantize 到自己輸出的 scale
-    layer_params = [
-        ('conv1',      'input',    'conv1',      model.conv1),
-        ('conv2',      'sigmoid1', 'conv2',      model.conv2),
+    # sigmoid 前層：用 compute_offline_params_sigmoid（s_out 已抵消）
+    sigmoid_layers = [
+        ('conv1', 'input',    model.conv1),
+        ('conv2', 'sigmoid1', model.conv2),
+        ('dnn',   'linear',   model.dnn),
+    ]
+    for lname, in_name, module in sigmoid_layers:
+        s_in_l, zp_in_l = aq(in_name)
+        q = wq[lname]
+        M0, n, K = compute_offline_params_sigmoid(
+            s_in=s_in_l, scale_w=q['scale_w'].numpy(),
+            zp_in=zp_in_l,
+            w_int=q['w_int'].numpy(),
+            b_int=q['b_int'].numpy() if q['b_int'] is not None else None,
+        )
+        save_offline(lname, M0, n, K)
+        save_txt(q['w_int'].numpy().astype(np.int8),
+                 os.path.join(outdir, f'{lname}_w.txt'))
+        if q['b_int'] is not None:
+            save_txt(q['b_int'].numpy(),
+                     os.path.join(outdir, f'{lname}_b.txt'))
+
+    # sigmoid 輸出端 requantize 參數：M_out, n_out, Z_out
+    # M_out = round(S_fixed_out / s_out * 2^n_out)
+    # 對應 sigmoid1/sigmoid2/sigmoid3 各自的 s_out, zp_out
+    S_FIXED_OUT = 1.0 / (2 ** 16)
+    sigmoid_out_layers = [
+        ('sigmoid1', 'sigmoid1'),
+        ('sigmoid2', 'sigmoid2'),
+        ('sigmoid3', 'sigmoid3'),
+    ]
+    for sig_name, aq_name in sigmoid_out_layers:
+        s_out_l, zp_out_l = aq(aq_name)
+        M_ratio = S_FIXED_OUT / s_out_l                     # scalar float
+
+        # 正規化 n_out
+        n_out = 0
+        while M_ratio * (2 ** n_out) < 0.5:
+            n_out += 1
+
+        # M0_out
+        m0_out = int(round(M_ratio * (2 ** (n_out + 32))))
+
+        save_txt(np.array([m0_out],  dtype=np.uint32),  os.path.join(outdir, f'{sig_name}_M_out.txt'))
+        save_txt(np.array([n_out],   dtype=np.int64),  os.path.join(outdir, f'{sig_name}_n_out.txt'))
+        save_zp(zp_out_l,                              os.path.join(outdir, f'{sig_name}_zp_out.txt'))
+
+    # 一般層：用 compute_offline_params（需要 s_out, zp_out）
+    normal_layers = [
         ('linear',     'sigmoid2', 'linear',     model.linear),
-        ('dnn',        'linear',   'dnn',        model.dnn),
         ('classifier', 'sigmoid3', 'classifier', model.classifier),
     ]
-    for lname, in_name, out_name, module in layer_params:
+    for lname, in_name, out_name, module in normal_layers:
         s_in_l,  zp_in_l  = aq(in_name)
         s_out_l, zp_out_l = aq(out_name)
         save_zp(zp_out_l, os.path.join(outdir, f'{lname}_zp_out.txt'))
@@ -267,27 +341,18 @@ def integer_forward(pth_path: str, pruned_pth_path: str,
         _ = model(x_deq)
  
     # ── 把各層 float 輸出量化成整數存檔 ──────────────────────────────────────
-    # conv1/conv2/dnn 是 sigmoid 前，對稱量化（int8，Z=0）
-    # sigmoid 輸出、linear 是非對稱量化（uint8）
-    SYMMETRIC_LAYERS = {'conv1', 'conv2', 'dnn'}
-
+    # 所有 activation 統一 uint8
     def quantize_and_save(hook_name, aq_name, file_name):
         s, zp = aq(aq_name)
-        if aq_name in SYMMETRIC_LAYERS:
-            out_q = to_int8(layer_outputs[hook_name], s, zp, n_bits)
-        else:
-            out_q = to_uint8(layer_outputs[hook_name], s, zp, n_bits)
+        out_q = to_uint8(layer_outputs[hook_name], s, zp, n_bits)
         save_txt(out_q.numpy(), os.path.join(outdir, file_name))
 
-    # sigmoid 輸入（int8，對稱量化）
     quantize_and_save('conv1_out',    'conv1',    'conv1_q.txt')
     quantize_and_save('conv2_out',    'conv2',    'conv2_q.txt')
     quantize_and_save('dnn_out',      'dnn',      'dnn_q.txt')
-    # sigmoid 輸出（uint8，非對稱量化）
     quantize_and_save('sigmoid1_out', 'sigmoid1', 'sigmoid1_q.txt')
     quantize_and_save('sigmoid2_out', 'sigmoid2', 'sigmoid2_q.txt')
     quantize_and_save('sigmoid3_out', 'sigmoid3', 'sigmoid3_q.txt')
-    # linear（uint8，非對稱量化）
     quantize_and_save('linear_out',   'linear',   'linear_q.txt')
 
     # classifier 不量化，存 float logits
@@ -312,7 +377,7 @@ CFG = dict(
     num_classes       = 12,
     dropout_rate      = 0.1,
     prune_ratio_conv1 = 0.5,
-    prune_ratio_conv2 = 0.5,
+    prune_ratio_conv2 = 0.25,
 )
  
 if __name__ == '__main__':
